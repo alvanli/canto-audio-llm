@@ -1,0 +1,22 @@
+services:
+  canto-audio-llm:
+    ipc: host
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: "canto-audio-llm"
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['0', '1'] # Change to ['0', '1'] to use two GPUs
+            capabilities: [gpu]
+    tty: true 
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      HF_HUB_CACHE: /exp/cache
+      WANDB_API_KEY: ${WANDB_API_KEY}
+    volumes:
+      - ~/Documents/canto-audio-llm:/exp
+      - ~/Documents/canto-youtube-dl:/data
