@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import os
 import wandb
 import numpy as np
+from tqdm import tqdm
 import torch
 from torch.optim import AdamW, lr_scheduler
 from torch.utils.data import DataLoader
@@ -29,6 +30,7 @@ def log_metrics(curr_steps, all_l2_losses, all_kl_losses, optimizer, bs):
         "kl_loss": kl_loss,
         "lr": lr
     }
+    print(log_dict)
     wandb.log(log_dict)
     return
 
@@ -36,11 +38,11 @@ def log_metrics(curr_steps, all_l2_losses, all_kl_losses, optimizer, bs):
 @dataclass
 class TrainArguments:
     w1: float = field(default=1.0)
-    w2: float = field(default=1.0)
+    w2: float = field(default=0.05)
     num_epochs: int = field(default=2)
     microbatch_size: int = field(default=12)
     batch_size: int = field(default=50)
-    print_every: int = field(default=500)
+    print_every: int = field(default=200)
     lr: float = field(default=1e-5)
     save_every: int = field(default=5_000)
     save_dir: str = field(default="./logs/default")
@@ -70,7 +72,7 @@ if __name__ == "__main__":
     )
     model = DiVAModel(
         whisper_path="Scrya/whisper-large-v2-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
-        is_train=True, speech_encoder_device="cuda:1"
+        is_train=True, speech_encoder_device="cuda:0"
     )
 
     def tokenize_function(examples):
@@ -102,22 +104,22 @@ if __name__ == "__main__":
     )
 
     accum_samples = 0
-    current_batch_size = model_args.batch_size
+    bs = model_args.batch_size
     curr_steps = 0
     scaler = amp.GradScaler()
     for epoch in range(model_args.num_epochs):
         model.train()
         all_l2_losses = []
         all_kl_losses = []
-        for i, batch in enumerate(train_dataloader):
+        for i, batch in tqdm(enumerate(train_dataloader), total=LEN_DATASET // model_args.microbatch_size):
             accum_samples += model_args.microbatch_size
+            curr_steps += 1
 
             audio, input_ids, attention_mask = batch['audio'], batch['input_ids'], batch['attention_mask']
             optimizer.zero_grad()
             audio_embed, text_embed, audio_response, text_response = model.train_forward(audio, input_ids, attention_mask)
-            
+
             l2_loss = l2_loss_fn(audio_embed, text_embed[:,-448:])
-            # scaler.scale(l2_loss).backward()
             kl_loss = F.kl_div(
                 F.log_softmax(audio_response, dim=-1), 
                 F.softmax(text_response, dim=-1), 
@@ -126,20 +128,19 @@ if __name__ == "__main__":
             loss_sum = model_args.w1 * l2_loss + model_args.w2 * kl_loss
             scaler.scale(loss_sum).backward()
             
-            curr_steps += 1
             scheduler.step()
-            if accum_samples >= current_batch_size:
+            if accum_samples >= bs:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.step()
                 optimizer.zero_grad()
                 accum_samples = 0
-                                
+                  
             all_l2_losses.append(l2_loss.detach().item())
             all_kl_losses.append(kl_loss.detach().item())
             
             if curr_steps % model_args.print_every == 0:
-                log_metrics(curr_steps, all_l2_losses, all_kl_losses, optimizer, current_batch_size)
+                log_metrics(curr_steps, all_l2_losses, all_kl_losses, optimizer, bs)
                 
             if curr_steps % model_args.save_every == 0:
                 model.save(f"{model_args.save_dir}/step_{curr_steps}")

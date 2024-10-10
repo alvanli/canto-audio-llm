@@ -13,10 +13,10 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     AutoModelForCausalLM,
-    PreTrainedModel,
-    WhisperForConditionalGeneration,
+    PreTrainedModel
 )
 from .modeling_qwen2 import Qwen2ForCausalLM
+from .modeling_whisper import WhisperForConditionalGeneration
 
 class QFormer(nn.Module):
     def __init__(
@@ -27,7 +27,7 @@ class QFormer(nn.Module):
         self.projection = nn.Linear(1280, 3584)
         self.query_tokens = nn.Parameter(torch.randn(448, 1280))
 
-    def forward(self, x, output_device="cuda:1"):
+    def forward(self, x, output_device="cuda:0"):
         bsz = x.shape[0]
         query_tokens = self.query_tokens[None, :, :].expand(bsz, -1, -1)
         virt_whisper_tokens = self.decoder(
@@ -73,18 +73,22 @@ class DiVAModel(PreTrainedModel):
             device_map = dict(
                 **{"model.embed_tokens": 0, "model.norm": 0, "lm_head": 0},
                 **{
-                    f"model.layers.{i}": 0 if i < split_index else 1
+                    f"model.layers.{i}": 0 if i < split_index else 0
                     for i in range(num_layers)
                 },
             )
 
         self.qformer = connector.to(speech_encoder_device)
         self.whisper_encoder = whisper.model.encoder.to(speech_encoder_device)
+        self.whisper_encoder.training = True
+    
         self.llm_decoder = Qwen2ForCausalLM.from_pretrained(
             llm_path,
             device_map=device_map,
             torch_dtype=torch.float16,
         )
+        self.llm_decoder.training = True
+        
         if is_train:
             for param in self.llm_decoder.parameters():
                 param.requires_grad = False
@@ -163,6 +167,8 @@ class DiVAModel(PreTrainedModel):
         hidden_states = self.whisper_encoder(input_features=input_features)[
             "last_hidden_state"
         ]
+        if torch.isnan(hidden_states).any():
+            breakpoint()
         audio_embed = self.qformer(
             hidden_states,
             output_device=self.llm_decoder.model.embed_tokens.weight.device,
@@ -208,6 +214,8 @@ class DiVAModel(PreTrainedModel):
         return audio_embed, text_embed, audio_response.logits, text_response.logits
 
     def save(self, path):
+        if not os.path.isdir(path):
+            os.mkdir(path)
         torch.save(self.whisper_encoder.state_dict(), f'{path}/whisper_encoder.pth')
         torch.save(self.qformer.state_dict(), f'{path}/qformer.pth')
         
