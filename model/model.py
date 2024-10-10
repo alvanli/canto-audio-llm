@@ -16,7 +16,7 @@ from transformers import (
     PreTrainedModel,
     WhisperForConditionalGeneration,
 )
-
+from .modeling_qwen2 import Qwen2ForCausalLM
 
 class QFormer(nn.Module):
     def __init__(
@@ -24,7 +24,7 @@ class QFormer(nn.Module):
     ):
         super().__init__()
         self.decoder = None
-        self.projection = nn.Linear(1280, 4096)
+        self.projection = nn.Linear(1280, 3584)
         self.query_tokens = nn.Parameter(torch.randn(448, 1280))
 
     def forward(self, x, output_device="cuda:1"):
@@ -69,8 +69,7 @@ class DiVAModel(PreTrainedModel):
 
         if device_map == None:
             num_layers = 28
-            num_gpus = 2
-            split_index = 20
+            split_index = 24
             device_map = dict(
                 **{"model.embed_tokens": 0, "model.norm": 0, "lm_head": 0},
                 **{
@@ -81,7 +80,7 @@ class DiVAModel(PreTrainedModel):
 
         self.qformer = connector.to(speech_encoder_device)
         self.whisper_encoder = whisper.model.encoder.to(speech_encoder_device)
-        self.llm_decoder = AutoModelForCausalLM.from_pretrained(
+        self.llm_decoder = Qwen2ForCausalLM.from_pretrained(
             llm_path,
             device_map=device_map,
             torch_dtype=torch.float16,
@@ -176,33 +175,37 @@ class DiVAModel(PreTrainedModel):
         # Generate text embeddings
         text_embed = self.llm_decoder.model.embed_tokens(input_ids)
 
-        text_position_ids = torch.arange(
-            text_embed.size(1), dtype=torch.long, device=decoder_device
-        ).unsqueeze(0).expand(text_embed.size(0), -1)
-
         text_response = self.llm_decoder(
             inputs_embeds=text_embed.half(),
             attention_mask=attention_mask,
-            position_ids=text_position_ids,
             return_dict=True,
             output_hidden_states=True
         )
 
-        # attention_mask_aud = torch.ones(
-        #     audio_embed.shape[0], audio_embed.shape[1],
-        #     device=audio_embed.device, dtype=torch.long
-        # )
         
+        if text_embed.size(0) == 1:
+            audio_embed = audio_embed.unsqueeze(0)
+        max_seq_len = 1024
+        padded_audio_embed = torch.zeros(
+            audio_embed.size(0), max_seq_len, audio_embed.size(2),
+            device=decoder_device, dtype=audio_embed.dtype
+        )
+        padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
+        attention_mask_aud = torch.zeros(
+            audio_embed.size(0), max_seq_len,
+            device=decoder_device, dtype=torch.long
+        )
+        attention_mask_aud[:, :audio_embed.size(1)] = 1
+        
+        audio_embed = audio_embed.to(decoder_device)
         audio_response = self.llm_decoder(
-            inputs_embeds=audio_embed.to(
-                self.llm_decoder.model.embed_tokens.weight.device
-            ).half(),
-            # attention_mask=attention_mask_aud,
+            inputs_embeds=padded_audio_embed.half(),
+            attention_mask=attention_mask_aud,
             return_dict=True,
             output_hidden_states=True
         )
 
-        return audio_embed, text_embed, audio_response, text_response
+        return audio_embed, text_embed, audio_response.logits, text_response.logits
 
     def save(self, path):
         torch.save(self.whisper_encoder.state_dict(), f'{path}/whisper_encoder.pth')

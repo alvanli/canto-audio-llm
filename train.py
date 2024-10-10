@@ -91,7 +91,8 @@ if __name__ == "__main__":
         lr=model_args.lr,
         betas=(0.9, 0.98),
         eps=1e-09,
-        weight_decay=0.1
+        weight_decay=0.1,
+        foreach=True
     )
 
     scheduler = lr_scheduler.CosineAnnealingLR(
@@ -115,7 +116,8 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             audio_embed, text_embed, audio_response, text_response = model.train_forward(audio, input_ids, attention_mask)
             
-            l2_loss = l2_loss_fn(audio_embed, text_embed)
+            l2_loss = l2_loss_fn(audio_embed, text_embed[:,-448:])
+            # scaler.scale(l2_loss).backward()
             kl_loss = F.kl_div(
                 F.log_softmax(audio_response, dim=-1), 
                 F.softmax(text_response, dim=-1), 
