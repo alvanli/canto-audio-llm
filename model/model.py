@@ -18,14 +18,15 @@ from transformers import (
 from .modeling_qwen2 import Qwen2ForCausalLM
 from .modeling_whisper import WhisperForConditionalGeneration
 
+WHISPER_EMBED_DIM = 768
 class QFormer(nn.Module):
     def __init__(
         self,
     ):
         super().__init__()
         self.decoder = None
-        self.projection = nn.Linear(1280, 3584)
-        self.query_tokens = nn.Parameter(torch.randn(448, 1280))
+        self.projection = nn.Linear(WHISPER_EMBED_DIM, 3584)
+        self.query_tokens = nn.Parameter(torch.randn(448, WHISPER_EMBED_DIM))
 
     def forward(self, x, output_device="cuda:0"):
         bsz = x.shape[0]
@@ -42,7 +43,7 @@ class DiVAModel(PreTrainedModel):
 
     def __init__(
         self, via_path=None, config_dict={}, device_map=None, speech_encoder_device="cuda:0",
-        whisper_path="Scrya/whisper-large-v2-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
+        whisper_path="alvanlii/whisper-small-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
         is_train=False
     ):
         super().__init__(DiVAConfig.from_dict(config_dict))
@@ -112,6 +113,9 @@ class DiVAModel(PreTrainedModel):
             )
         ).to(embed_device)
         self.speech_encoder_device = speech_encoder_device
+        self.pad_embed = self.tokenizer.encode("<|endoftext|>")
+        torch.nn.utils.clip_grad_norm_(self.whisper_encoder.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.qformer.parameters(), max_norm=1.0)
 
     def can_generate(cls):
         return False
@@ -181,36 +185,34 @@ class DiVAModel(PreTrainedModel):
         text_embed = self.llm_decoder.model.embed_tokens(input_ids)
 
         with torch.no_grad():
-            text_response = self.llm_decoder(
-                inputs_embeds=text_embed.half(),
-                attention_mask=attention_mask,
-                return_dict=True,
-                output_hidden_states=True
-            )
-
-        
-        if text_embed.size(0) == 1:
-            audio_embed = audio_embed.unsqueeze(0)
-        max_seq_len = 1024
-        padded_audio_embed = torch.zeros(
-            audio_embed.size(0), max_seq_len, audio_embed.size(2),
-            device=decoder_device, dtype=audio_embed.dtype
-        )
-        padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
-        attention_mask_aud = torch.zeros(
-            audio_embed.size(0), max_seq_len,
-            device=decoder_device, dtype=torch.long
-        )
-        attention_mask_aud[:, :audio_embed.size(1)] = 1
-        
-        audio_embed = audio_embed.to(decoder_device)
-        audio_response = self.llm_decoder(
-            inputs_embeds=padded_audio_embed.half(),
-            attention_mask=attention_mask_aud,
-            return_dict=True,
-            output_hidden_states=True
-        )
-
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                text_response = self.llm_decoder(
+                    inputs_embeds=text_embed,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    output_hidden_states=True
+                )
+                if text_embed.size(0) == 1:
+                    audio_embed = audio_embed.unsqueeze(0)
+                max_seq_len = 1024
+                padded_audio_embed = torch.zeros(
+                    audio_embed.size(0), max_seq_len, audio_embed.size(2),
+                    device=decoder_device, dtype=audio_embed.dtype
+                )
+                padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
+                attention_mask_aud = torch.zeros(
+                    audio_embed.size(0), max_seq_len,
+                    device=decoder_device, dtype=torch.long
+                )
+                attention_mask_aud[:, :audio_embed.size(1)] = 1
+                
+                audio_embed = audio_embed.to(decoder_device)
+                audio_response = self.llm_decoder(
+                    inputs_embeds=padded_audio_embed,
+                    attention_mask=attention_mask_aud,
+                    return_dict=True,
+                    output_hidden_states=True
+                )
         return audio_embed, text_embed, audio_response.logits, text_response.logits
 
     def save(self, path):

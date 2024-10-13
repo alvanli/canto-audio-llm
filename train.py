@@ -71,7 +71,7 @@ if __name__ == "__main__":
         config={**model_args.__dict__},
     )
     model = DiVAModel(
-        whisper_path="Scrya/whisper-large-v2-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
+        whisper_path="alvanlii/whisper-small-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
         is_train=True, speech_encoder_device="cuda:0"
     )
 
@@ -108,7 +108,7 @@ if __name__ == "__main__":
     curr_steps = 0
     # scaler = amp.GradScaler()
     model = model.train()
-    model = model.gradient_checkpointing_enable()
+    # model = model.gradient_checkpointing_enable()
 
     for epoch in range(model_args.num_epochs):
         all_l2_losses = []
@@ -123,12 +123,15 @@ if __name__ == "__main__":
 
             l2_loss = l2_loss_fn(audio_embed, text_embed[:,-448:])
             kl_loss = F.kl_div(
-                F.log_softmax(audio_response, dim=-1), 
-                F.softmax(text_response, dim=-1), 
+                F.log_softmax(audio_response[:,:448,:], dim=-1), 
+                F.softmax(text_response[:,-448:,:], dim=-1), 
                 reduction='batchmean'
             )
+            if (torch.isnan(kl_loss)):
+                breakpoint()
+            print(kl_loss)
             loss_sum = model_args.w1 * l2_loss + model_args.w2 * kl_loss
-            loss_sum.backward()
+            # loss_sum.backward()
             # scaler.scale(loss_sum).backward()
             
             scheduler.step()
