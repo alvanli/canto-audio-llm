@@ -27,6 +27,7 @@ class QFormer(nn.Module):
         self.decoder = None
         self.projection = nn.Linear(WHISPER_EMBED_DIM, 3584)
         self.query_tokens = nn.Parameter(torch.randn(448, WHISPER_EMBED_DIM))
+        self.layer_norm = nn.LayerNorm(448)
 
     def forward(self, x, output_device="cuda:0"):
         bsz = x.shape[0]
@@ -35,6 +36,7 @@ class QFormer(nn.Module):
             inputs_embeds=query_tokens, encoder_hidden_states=x
         )
         virtual_tokens = self.projection(virt_whisper_tokens[0])
+        virtual_tokens = self.layer_norm(virtual_tokens)
         return virtual_tokens.to(output_device)
 
 
@@ -113,7 +115,10 @@ class DiVAModel(PreTrainedModel):
             )
         ).to(embed_device)
         self.speech_encoder_device = speech_encoder_device
-        self.pad_embed = self.tokenizer.encode("<|endoftext|>")
+        pad_token = self.tokenizer.encode("<|endoftext|>")
+        self.pad_token_embed = self.llm_decoder.model.embed_tokens(
+            torch.tensor([pad_token]).to(self.llm_decoder.device)
+        ) 
         torch.nn.utils.clip_grad_norm_(self.whisper_encoder.parameters(), max_norm=1.0)
         torch.nn.utils.clip_grad_norm_(self.qformer.parameters(), max_norm=1.0)
 
@@ -175,7 +180,7 @@ class DiVAModel(PreTrainedModel):
         audio_embed = self.qformer(
             hidden_states,
             output_device=self.llm_decoder.model.embed_tokens.weight.device,
-        ).squeeze()
+        )
 
         decoder_device = self.llm_decoder.model.embed_tokens.weight.device
         input_ids = input_ids.to(decoder_device)
@@ -192,14 +197,20 @@ class DiVAModel(PreTrainedModel):
                     return_dict=True,
                     output_hidden_states=True
                 )
-                if text_embed.size(0) == 1:
-                    audio_embed = audio_embed.unsqueeze(0)
+                # if text_embed.size(0) == 1:
+                #     audio_embed = audio_embed.unsqueeze(0)
                 max_seq_len = 1024
-                padded_audio_embed = torch.zeros(
-                    audio_embed.size(0), max_seq_len, audio_embed.size(2),
-                    device=decoder_device, dtype=audio_embed.dtype
-                )
+                curr_padded_audio_embed = self.pad_token_embed.expand(
+                    audio_embed.size(0), max_seq_len, audio_embed.size(2)
+                ).clone()
                 padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
+
+                # padded_audio_embed = torch.zeros(
+                #     audio_embed.size(0), max_seq_len, audio_embed.size(2),
+                #     device=decoder_device, dtype=audio_embed.dtype
+                # )
+                # padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
+
                 attention_mask_aud = torch.zeros(
                     audio_embed.size(0), max_seq_len,
                     device=decoder_device, dtype=torch.long
