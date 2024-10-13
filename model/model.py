@@ -181,12 +181,13 @@ class DiVAModel(PreTrainedModel):
         # Generate text embeddings
         text_embed = self.llm_decoder.model.embed_tokens(input_ids)
 
-        text_response = self.llm_decoder(
-            inputs_embeds=text_embed.half(),
-            attention_mask=attention_mask,
-            return_dict=True,
-            output_hidden_states=True
-        )
+        with torch.no_grad():
+            text_response = self.llm_decoder(
+                inputs_embeds=text_embed.half(),
+                attention_mask=attention_mask,
+                return_dict=True,
+                output_hidden_states=True
+            )
 
         
         if text_embed.size(0) == 1:

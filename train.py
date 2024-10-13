@@ -78,7 +78,7 @@ if __name__ == "__main__":
     def tokenize_function(examples):
         return model.tokenizer(examples['text'], truncation=True, max_length=1024, return_tensors="pt", padding='max_length')
 
-    dataset = load_dataset('alvanlii/audio-llm-train', split='train', streaming=True) # load_from_disk('./data/combined_english_canto')
+    dataset = load_dataset('alvanlii/audio-llm-train-shuffled', split='train', streaming=True) # load_from_disk('./data/combined_english_canto')
     LEN_DATASET = 2_000_000
     tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
 
@@ -106,9 +106,11 @@ if __name__ == "__main__":
     accum_samples = 0
     bs = model_args.batch_size
     curr_steps = 0
-    scaler = amp.GradScaler()
+    # scaler = amp.GradScaler()
+    model = model.train()
+    model = model.gradient_checkpointing_enable()
+
     for epoch in range(model_args.num_epochs):
-        model.train()
         all_l2_losses = []
         all_kl_losses = []
         for i, batch in tqdm(enumerate(train_dataloader), total=LEN_DATASET // model_args.microbatch_size):
@@ -126,12 +128,14 @@ if __name__ == "__main__":
                 reduction='batchmean'
             )
             loss_sum = model_args.w1 * l2_loss + model_args.w2 * kl_loss
-            scaler.scale(loss_sum).backward()
+            loss_sum.backward()
+            # scaler.scale(loss_sum).backward()
             
             scheduler.step()
             if accum_samples >= bs:
-                scaler.step(optimizer)
-                scaler.update()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+                # scaler.step(optimizer)
+                # scaler.update()
                 optimizer.step()
                 optimizer.zero_grad()
                 accum_samples = 0
