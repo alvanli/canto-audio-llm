@@ -164,9 +164,8 @@ class DiVAModel(PreTrainedModel):
     def train_forward(self, audio, input_ids, attention_mask):
         inputs = self.processor(audio, return_tensors="pt", sampling_rate=16_000)
         input_features = inputs.input_features.to(self.speech_encoder_device)
-        hidden_states = self.whisper_encoder(input_features=input_features)[
-            "last_hidden_state"
-        ]
+        whisper_out = self.whisper_encoder(input_features=input_features)
+        hidden_states = whisper_out["last_hidden_state"]
         if torch.isnan(hidden_states).any():
             breakpoint()
         audio_embed = self.qformer(
