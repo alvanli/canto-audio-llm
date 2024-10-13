@@ -1024,13 +1024,13 @@ class WhisperEncoder(WhisperPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
-        if torch.isnan(inputs_embeds).any():
-            breakpoint()
+        # if torch.isnan(inputs_embeds).any():
+        #     breakpoint()
 
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
 
-        if torch.isnan(inputs_embeds).any():
-            breakpoint()
+        # if torch.isnan(inputs_embeds).any():
+        #     breakpoint()
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
         embed_pos = self.embed_positions.weight

@@ -27,7 +27,6 @@ class QFormer(nn.Module):
         self.decoder = None
         self.projection = nn.Linear(WHISPER_EMBED_DIM, 3584)
         self.query_tokens = nn.Parameter(torch.randn(448, WHISPER_EMBED_DIM))
-        self.layer_norm = nn.LayerNorm(448)
 
     def forward(self, x, output_device="cuda:0"):
         bsz = x.shape[0]
@@ -36,7 +35,7 @@ class QFormer(nn.Module):
             inputs_embeds=query_tokens, encoder_hidden_states=x
         )
         virtual_tokens = self.projection(virt_whisper_tokens[0])
-        virtual_tokens = self.layer_norm(virtual_tokens)
+        # virtual_tokens = torch.tanh(virtual_tokens)
         return virtual_tokens.to(output_device)
 
 
@@ -88,7 +87,7 @@ class DiVAModel(PreTrainedModel):
         self.llm_decoder = Qwen2ForCausalLM.from_pretrained(
             llm_path,
             device_map=device_map,
-            torch_dtype=torch.float16,
+            # torch_dtype=torch.float16,
         )
         self.llm_decoder.training = True
         
@@ -119,8 +118,8 @@ class DiVAModel(PreTrainedModel):
         self.pad_token_embed = self.llm_decoder.model.embed_tokens(
             torch.tensor([pad_token]).to(self.llm_decoder.device)
         ) 
-        torch.nn.utils.clip_grad_norm_(self.whisper_encoder.parameters(), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(self.qformer.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.whisper_encoder.parameters(), max_norm=2.0)
+        torch.nn.utils.clip_grad_norm_(self.qformer.parameters(), max_norm=2.0)
 
     def can_generate(cls):
         return False
@@ -190,7 +189,7 @@ class DiVAModel(PreTrainedModel):
         text_embed = self.llm_decoder.model.embed_tokens(input_ids)
 
         with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.autocast(device_type="cuda", dtype=torch.float32):
                 text_response = self.llm_decoder(
                     inputs_embeds=text_embed,
                     attention_mask=attention_mask,
@@ -203,7 +202,7 @@ class DiVAModel(PreTrainedModel):
                 curr_padded_audio_embed = self.pad_token_embed.expand(
                     audio_embed.size(0), max_seq_len, audio_embed.size(2)
                 ).clone()
-                padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
+                curr_padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
 
                 # padded_audio_embed = torch.zeros(
                 #     audio_embed.size(0), max_seq_len, audio_embed.size(2),
@@ -217,9 +216,8 @@ class DiVAModel(PreTrainedModel):
                 )
                 attention_mask_aud[:, :audio_embed.size(1)] = 1
                 
-                audio_embed = audio_embed.to(decoder_device)
                 audio_response = self.llm_decoder(
-                    inputs_embeds=padded_audio_embed,
+                    inputs_embeds=curr_padded_audio_embed,
                     attention_mask=attention_mask_aud,
                     return_dict=True,
                     output_hidden_states=True

@@ -38,7 +38,7 @@ def log_metrics(curr_steps, all_l2_losses, all_kl_losses, optimizer, bs):
 @dataclass
 class TrainArguments:
     w1: float = field(default=1.0)
-    w2: float = field(default=0.05)
+    w2: float = field(default=0.2)
     num_epochs: int = field(default=2)
     microbatch_size: int = field(default=12)
     batch_size: int = field(default=50)
@@ -123,20 +123,19 @@ if __name__ == "__main__":
 
             l2_loss = l2_loss_fn(audio_embed, text_embed[:,-448:])
             kl_loss = F.kl_div(
-                F.log_softmax(audio_response[:,:448,:], dim=-1), 
-                F.softmax(text_response[:,-448:,:], dim=-1), 
+                F.log_softmax(audio_response, dim=-1), 
+                F.softmax(text_response, dim=-1), 
                 reduction='batchmean'
             )
             if (torch.isnan(kl_loss)):
                 breakpoint()
-            print(kl_loss)
             loss_sum = model_args.w1 * l2_loss + model_args.w2 * kl_loss
-            # loss_sum.backward()
+            loss_sum.backward()
             # scaler.scale(loss_sum).backward()
             
             scheduler.step()
             if accum_samples >= bs:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+                # print("updating")
                 # scaler.step(optimizer)
                 # scaler.update()
                 optimizer.step()
