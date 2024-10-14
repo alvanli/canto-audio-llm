@@ -38,12 +38,12 @@ def log_metrics(curr_steps, all_l2_losses, all_kl_losses, optimizer, bs):
 @dataclass
 class TrainArguments:
     w1: float = field(default=1.0)
-    w2: float = field(default=0.2)
+    w2: float = field(default=1.0)
     num_epochs: int = field(default=2)
     microbatch_size: int = field(default=12)
     batch_size: int = field(default=50)
     print_every: int = field(default=200)
-    lr: float = field(default=1e-5)
+    lr: float = field(default=5e-5)
     save_every: int = field(default=5_000)
     save_dir: str = field(default="./logs/default")
 
@@ -99,7 +99,7 @@ if __name__ == "__main__":
 
     scheduler = lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=model_args.num_epochs * LEN_DATASET // model_args.batch_size,
+        T_max=model_args.num_epochs * LEN_DATASET // model_args.microbatch_size,
         eta_min=0
     )
 
@@ -118,15 +118,18 @@ if __name__ == "__main__":
             curr_steps += 1
 
             audio, input_ids, attention_mask = batch['audio'], batch['input_ids'], batch['attention_mask']
+            with torch.no_grad():
+                next_token_indices = attention_mask.sum(dim=1).long()
             optimizer.zero_grad()
             audio_embed, text_embed, audio_response, text_response = model.train_forward(audio, input_ids, attention_mask)
 
+            # getting only the next token
+            with torch.no_grad():
+                text_index_in_order = torch.arange(text_response.shape[0])
+            text_response_for_kl = text_response[text_index_in_order, next_token_indices, :].unsqueeze(1)
             l2_loss = l2_loss_fn(audio_embed, text_embed[:,-448:])
-            kl_loss = F.kl_div(
-                F.log_softmax(audio_response, dim=-1), 
-                F.softmax(text_response, dim=-1), 
-                reduction='batchmean'
-            )
+            kl_loss = l2_loss_fn(audio_response[:,448:449,:], text_response_for_kl)
+
             if (torch.isnan(kl_loss)):
                 breakpoint()
             loss_sum = model_args.w1 * l2_loss + model_args.w2 * kl_loss
@@ -135,7 +138,6 @@ if __name__ == "__main__":
             
             scheduler.step()
             if accum_samples >= bs:
-                # print("updating")
                 # scaler.step(optimizer)
                 # scaler.update()
                 optimizer.step()

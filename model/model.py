@@ -222,7 +222,7 @@ class DiVAModel(PreTrainedModel):
                     return_dict=True,
                     output_hidden_states=True
                 )
-        return audio_embed, text_embed, audio_response.logits, text_response.logits
+        return audio_embed, text_embed, audio_response.hidden_states[-1], text_response.hidden_states[-1]
 
     def save(self, path):
         if not os.path.isdir(path):
