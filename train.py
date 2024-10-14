@@ -43,7 +43,7 @@ class TrainArguments:
     microbatch_size: int = field(default=12)
     batch_size: int = field(default=50)
     print_every: int = field(default=200)
-    lr: float = field(default=5e-5)
+    lr: float = field(default=2e-5)
     save_every: int = field(default=5_000)
     save_dir: str = field(default="./logs/default")
 

@@ -1,6 +1,6 @@
 python train.py \
     --num_epochs 1 \
-    --microbatch_size 8 \
+    --microbatch_size 1 \
     --batch_size 1000 \
     --save_dir "./logs/v00" \
     --print_every 100 \
