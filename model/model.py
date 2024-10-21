@@ -15,7 +15,7 @@ from transformers import (
     AutoModelForCausalLM,
     PreTrainedModel
 )
-from .modeling_qwen2 import Qwen2ForCausalLM
+from .modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
 from .modeling_whisper import WhisperForConditionalGeneration
 
 WHISPER_EMBED_DIM = 768
@@ -69,35 +69,50 @@ class DiVAModel(PreTrainedModel):
                 }
                 connector.decoder.load_state_dict(wsd)
 
+        
         if device_map == None:
-            num_layers = 28
-            split_index = 24
-            device_map = dict(
-                **{"model.embed_tokens": 0, "model.norm": 0, "lm_head": 0},
-                **{
-                    f"model.layers.{i}": 0 if i < split_index else 0
-                    for i in range(num_layers)
-                },
-            )
+            if is_train:
+                num_layers = 28
+                split_index = 14
+                device_map = dict(
+                    **{"embed_tokens": 0, "norm": 0},
+                    **{
+                        f"layers.{i}": 0 if i < split_index else 1
+                        for i in range(num_layers)
+                    },
+                )
+            else:
+                num_layers = 28
+                split_index = 12
+                device_map = dict(
+                    **{"model.embed_tokens": 0, "model.norm": 0, "lm_head": 0},
+                    **{
+                        f"model.layers.{i}": 0 if i < split_index else 1
+                        for i in range(num_layers)
+                    },
+                )
 
         self.qformer = connector.to(speech_encoder_device)
         self.whisper_encoder = whisper.model.encoder.to(speech_encoder_device)
         self.whisper_encoder.training = True
-    
-        self.llm_decoder = Qwen2ForCausalLM.from_pretrained(
-            llm_path,
-            device_map=device_map,
-            # torch_dtype=torch.float16,
-        )
-        self.llm_decoder.training = True
-        
+
         if is_train:
-            for param in self.llm_decoder.parameters():
-                param.requires_grad = False
+            self.llm_decoder = Qwen2Model.from_pretrained(
+                llm_path,
+                device_map=device_map,
+            )
+            # self.llm_decoder.training = True
+            self.llm_decoder.requires_grad_(False)
+        else:
+            self.llm_decoder = Qwen2ForCausalLM.from_pretrained(
+                llm_path,
+                device_map=device_map,
+            )
+        
         self.processor = AutoProcessor.from_pretrained(whisper_path)
         self.tokenizer = AutoTokenizer.from_pretrained(llm_path)
         
-        embed_device = self.llm_decoder.model.embed_tokens.weight.device
+        embed_device = self.llm_decoder.embed_tokens.weight.device
         self.prefix = torch.tensor(
             self.tokenizer.encode(
                 "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
@@ -115,7 +130,7 @@ class DiVAModel(PreTrainedModel):
         ).to(embed_device)
         self.speech_encoder_device = speech_encoder_device
         pad_token = self.tokenizer.encode("<|endoftext|>")
-        self.pad_token_embed = self.llm_decoder.model.embed_tokens(
+        self.pad_token_embed = self.llm_decoder.embed_tokens(
             torch.tensor([pad_token]).to(self.llm_decoder.device)
         ) 
         torch.nn.utils.clip_grad_norm_(self.whisper_encoder.parameters(), max_norm=2.0)
@@ -176,53 +191,54 @@ class DiVAModel(PreTrainedModel):
         hidden_states = whisper_out["last_hidden_state"]
         if torch.isnan(hidden_states).any():
             breakpoint()
+        decoder_device = self.llm_decoder.embed_tokens.weight.device
+
         audio_embed = self.qformer(
             hidden_states,
-            output_device=self.llm_decoder.model.embed_tokens.weight.device,
+            output_device=decoder_device,
         )
 
-        decoder_device = self.llm_decoder.model.embed_tokens.weight.device
         input_ids = input_ids.to(decoder_device)
         attention_mask = attention_mask.to(decoder_device)
 
         # Generate text embeddings
-        text_embed = self.llm_decoder.model.embed_tokens(input_ids)
+        text_embed = self.llm_decoder.embed_tokens(input_ids)
 
-        with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.float32):
-                text_response = self.llm_decoder(
-                    inputs_embeds=text_embed,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    output_hidden_states=True
-                )
-                # if text_embed.size(0) == 1:
-                #     audio_embed = audio_embed.unsqueeze(0)
-                max_seq_len = 1024
-                curr_padded_audio_embed = self.pad_token_embed.expand(
-                    audio_embed.size(0), max_seq_len, audio_embed.size(2)
-                ).clone()
-                curr_padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
+        # with torch.no_grad():
+        #     with torch.autocast(device_type="cuda", dtype=torch.float32):
+        text_response = self.llm_decoder(
+            inputs_embeds=text_embed,
+            attention_mask=attention_mask,
+            return_dict=True,
+            output_hidden_states=True
+        )
+        # if text_embed.size(0) == 1:
+        #     audio_embed = audio_embed.unsqueeze(0)
+        max_seq_len = 1024
+        curr_padded_audio_embed = self.pad_token_embed.expand(
+            audio_embed.size(0), max_seq_len, audio_embed.size(2)
+        ).clone()
+        curr_padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
 
-                # padded_audio_embed = torch.zeros(
-                #     audio_embed.size(0), max_seq_len, audio_embed.size(2),
-                #     device=decoder_device, dtype=audio_embed.dtype
-                # )
-                # padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
+        # padded_audio_embed = torch.zeros(
+        #     audio_embed.size(0), max_seq_len, audio_embed.size(2),
+        #     device=decoder_device, dtype=audio_embed.dtype
+        # )
+        # padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
 
-                attention_mask_aud = torch.zeros(
-                    audio_embed.size(0), max_seq_len,
-                    device=decoder_device, dtype=torch.long
-                )
-                attention_mask_aud[:, :audio_embed.size(1)] = 1
-                
-                audio_response = self.llm_decoder(
-                    inputs_embeds=curr_padded_audio_embed,
-                    attention_mask=attention_mask_aud,
-                    return_dict=True,
-                    output_hidden_states=True
-                )
-        return audio_embed, text_embed, audio_response.hidden_states[-1], text_response.hidden_states[-1]
+        attention_mask_aud = torch.zeros(
+            audio_embed.size(0), max_seq_len,
+            device=decoder_device, dtype=torch.long
+        )
+        attention_mask_aud[:, :audio_embed.size(1)] = 1
+        
+        audio_response = self.llm_decoder(
+            inputs_embeds=curr_padded_audio_embed,
+            attention_mask=attention_mask_aud,
+            return_dict=True,
+            output_hidden_states=True
+        )
+        return audio_embed, text_embed, audio_response.last_hidden_state, text_response.last_hidden_state
 
     def save(self, path):
         if not os.path.isdir(path):
@@ -230,6 +246,10 @@ class DiVAModel(PreTrainedModel):
         torch.save(self.whisper_encoder.state_dict(), f'{path}/whisper_encoder.pth')
         torch.save(self.qformer.state_dict(), f'{path}/qformer.pth')
         
+    def load_prev_checkpoint(self, path):
+        self.whisper_encoder.load_state_dict(torch.load(f"{path}/whisper_encoder.pth"))
+        self.qformer.load_state_dict(torch.load(f"{path}/qformer.pth"))
+
     def forward(self, audio, prefix_text_tokens, suffix_text_tokens):
         inputs = self.processor(audio, return_tensors="pt", sampling_rate=16_000)
         input_features = inputs.input_features.to(self.speech_encoder_device)
