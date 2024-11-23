@@ -51,10 +51,6 @@ class TrainArguments:
     total_rows: int = field(default=2_000_000)
 
 
-def l2_loss_fn(embedding_a, embedding_b):
-    return torch.mean((embedding_a - embedding_b) ** 2)
-
-
 def get_last_N(embeddings, N=448):
     batch_size, seq_len, dim = embeddings.size()
 
@@ -105,10 +101,15 @@ if __name__ == "__main__":
         project="CantoDiVA",
         config={**model_args.__dict__},
     )
+    # model = DiVAModel(
+    #     whisper_path="alvanlii/whisper-small-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
+    #     is_train=True, speech_encoder_device="cuda:1"
+    # )
     model = DiVAModel(
-        whisper_path="alvanlii/whisper-small-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
+        whisper_path="./logs/smaller-turbo", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
         is_train=True, speech_encoder_device="cuda:1"
     )
+    model = torch.compile(model)
 
     if model_args.start_step > 0:
         model.load_prev_checkpoint(f"{model_args.save_dir}/step_{model_args.start_step}")
@@ -116,7 +117,7 @@ if __name__ == "__main__":
     def tokenize_function(examples):
         return model.tokenizer(examples['text'], truncation=True, max_length=1024, return_tensors="pt", padding='max_length')
 
-    dataset = load_dataset('alvanlii/audio-llm-train-shuffled', split='train', streaming=True) # load_from_disk('./data/combined_english_canto')
+    dataset = load_dataset('alvanlii/audio-llm-train', split='train', streaming=True) # load_from_disk('./data/combined_english_canto')
     LEN_DATASET = model_args.total_rows
     tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
 
@@ -160,32 +161,50 @@ if __name__ == "__main__":
             accum_samples += model_args.microbatch_size
 
             audio, input_ids, attention_mask = batch['audio'], batch['input_ids'], batch['attention_mask']
-            with torch.no_grad():
-                next_token_indices = attention_mask.sum(dim=1).long()
-            audio_embed, text_embed, audio_response, text_response = model.train_forward(audio, input_ids, attention_mask)
+            audio_embed, text_embed, audio_response, text_response, attention_mask_aud = model.train_forward(audio, input_ids, attention_mask)
 
-            # getting only the next token
-            with torch.no_grad():
-                text_index_in_order = torch.arange(text_response.shape[0])
-            text_embed_last_N = get_last_N(text_embed)
+            # Compute KL Proxy Loss
+            diff_distill = audio_response[:,-1] - text_response[:,-1] # last_audio_logits - last_text_logits
+            kl_squared_diff = diff_distill.pow(2).sum(dim=-1)
+            kl_loss = kl_squared_diff.sqrt().mean()
+            
+            # Prepare Mask for Contrastive Loss
+            shifted_loss_mask = torch.roll(attention_mask, shifts=1, dims=1)
+            one_hot_first = torch.zeros_like(attention_mask)
+            one_hot_first[:, 0] = 1
+            corrected_loss_mask = shifted_loss_mask + one_hot_first
+            reversed_loss_mask = torch.flip(corrected_loss_mask, dims=[1])
+            reversed_loss_mask = (reversed_loss_mask > 0).float()
 
-            text_response_for_kl = text_response[text_index_in_order, next_token_indices, :].unsqueeze(1)
-            # text_response_for_kl = text_response[:,-1,:]
-            text_embed_last_N = text_embed[:,-448:,:]
-            l2_loss = l2_loss_fn(audio_embed, text_embed_last_N)
-            kl_loss = l2_loss_fn(audio_response[:,448:449,:], text_response_for_kl)
+            # Compute Contrastive Loss
+            # Ensure text_embed has a consistent max sequence length
+            max_seq_len = text_embed.size(1)
 
+            # Pad audio_embed to match text_embed's sequence length
+            audio_embed_padded = F.pad(
+                audio_embed, 
+                (0, 0, 0, max_seq_len - audio_embed.size(1)),  # Pad on the sequence dimension to the right
+                value=0
+            )
+
+            diff_contrast = audio_embed_padded - text_embed
+            contrastive_squared_diff = diff_contrast.pow(2).sum(dim=-1)
+            contrastive_loss = contrastive_squared_diff.sqrt()
+            reversed_loss_mask = reversed_loss_mask.to(contrastive_loss.device)
+            masked_contrastive_loss = contrastive_loss * reversed_loss_mask
+            l2_loss = masked_contrastive_loss.sum() / reversed_loss_mask.sum()
+            
             if (torch.isnan(kl_loss)):
                 breakpoint()
+
             loss_sum = model_args.w1 * l2_loss + model_args.w2 * kl_loss
-            # loss_sum.backward()
+
             scaler.scale(loss_sum / model_args.batch_size).backward()
             
             scheduler.step()
             if accum_samples >= bs:
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.step()
                 optimizer.zero_grad()
                 accum_samples = 0
                   

@@ -18,15 +18,18 @@ from transformers import (
 from .modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
 from .modeling_whisper import WhisperForConditionalGeneration
 
-WHISPER_EMBED_DIM = 768
+WHISPER_EMBED_DIM = 1280
+QWEN_DIM = 3584
+WHISPER_MAX_LENGTH = 448
+
 class QFormer(nn.Module):
     def __init__(
         self,
     ):
         super().__init__()
         self.decoder = None
-        self.projection = nn.Linear(WHISPER_EMBED_DIM, 3584)
-        self.query_tokens = nn.Parameter(torch.randn(448, WHISPER_EMBED_DIM))
+        self.projection = nn.Linear(WHISPER_EMBED_DIM, QWEN_DIM)
+        self.query_tokens = nn.Parameter(torch.randn(WHISPER_MAX_LENGTH, WHISPER_EMBED_DIM))
 
     def forward(self, x, output_device="cuda:0"):
         bsz = x.shape[0]
@@ -35,7 +38,6 @@ class QFormer(nn.Module):
             inputs_embeds=query_tokens, encoder_hidden_states=x
         )
         virtual_tokens = self.projection(virt_whisper_tokens[0])
-        # virtual_tokens = torch.tanh(virtual_tokens)
         return virtual_tokens.to(output_device)
 
 
@@ -73,7 +75,7 @@ class DiVAModel(PreTrainedModel):
         if device_map == None:
             if is_train:
                 num_layers = 28
-                split_index = 14
+                split_index = 17
                 device_map = dict(
                     **{"embed_tokens": 0, "norm": 0},
                     **{
@@ -101,7 +103,6 @@ class DiVAModel(PreTrainedModel):
                 llm_path,
                 device_map=device_map,
             )
-            # self.llm_decoder.training = True
             self.llm_decoder.requires_grad_(False)
         else:
             self.llm_decoder = Qwen2ForCausalLM.from_pretrained(
@@ -112,27 +113,65 @@ class DiVAModel(PreTrainedModel):
         self.processor = AutoProcessor.from_pretrained(whisper_path)
         self.tokenizer = AutoTokenizer.from_pretrained(llm_path)
         
-        embed_device = self.llm_decoder.embed_tokens.weight.device
+        if self.tokenizer.pad_token_id == None:
+            override_token = list(self.tokenizer.added_tokens_decoder.items())[-1]
+            self.tokenizer.pad_token_id = override_token[0]
+            self.tokenizer.pad_tokn = str(override_token[1])
+        prefix, suffix = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "PLACEHOLDER"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        ).split("PLACEHOLDER")
+
+        print("prefix", prefix, "suffix", suffix)
+        non_null = [line for line in prefix.split("\n") if line.strip()]
+        # prefix_tok = self.tokenizer.encode(prefix, add_special_tokens=False)
+        # suffix_tok = self.tokenizer.encode(suffix, add_special_tokens=False)
+        # self.prefix = torch.tensor(prefix_tok).to(
+        #     self.llm_decoder.model.embed_tokens.weight.device
+        # )
+
+        # self.pre_system = torch.tensor(
+        #     self.tokenizer.encode(non_null[0] + "\n", add_special_tokens=False)
+        # ).to(self.llm_decoder.model.embed_tokens.weight.device)
+        # self.post_system = torch.tensor(
+        #     self.tokenizer.encode("\n" + non_null[-1] + "\n", add_special_tokens=False)
+        # ).to(self.llm_decoder.model.embed_tokens.weight.device)
+        # self.final_header = torch.tensor(suffix_tok).to(
+        #     self.llm_decoder.model.embed_tokens.weight.device
+        # )
+        self.eos_token_id = 151645
+        self.bos_token_id = 151644
+        if is_train:
+            embed_device = self.llm_decoder.embed_tokens.weight.device
+        else:
+            embed_device = self.llm_decoder.model.embed_tokens.weight.device
         self.prefix = torch.tensor(
             self.tokenizer.encode(
-                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+                "<|im_start|>user\n\n"
             )
         ).to(embed_device)
         self.pre_user_suffix = torch.tensor(
             self.tokenizer.encode(
-                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
             )
         ).to(embed_device)
         self.final_header = torch.tensor(            
             self.tokenizer.encode(
-                "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                "<|im_end|>\n<|im_start>assistant\n\n"
             )
         ).to(embed_device)
         self.speech_encoder_device = speech_encoder_device
-        pad_token = self.tokenizer.encode("<|endoftext|>")
-        self.pad_token_embed = self.llm_decoder.embed_tokens(
-            torch.tensor([pad_token]).to(self.llm_decoder.device)
-        ) 
+        pad_token = self.tokenizer.encode("<|endoftext|>")[0]
+        self.pad_token_id = pad_token
+        if is_train:
+            self.pad_token_embed = self.llm_decoder.embed_tokens(
+                torch.tensor([pad_token]).to(self.llm_decoder.device)
+            ) 
+        else:
+            self.pad_token_embed = self.llm_decoder.model.embed_tokens(
+                torch.tensor([pad_token]).to(self.llm_decoder.device)
+            ) 
         torch.nn.utils.clip_grad_norm_(self.whisper_encoder.parameters(), max_norm=2.0)
         torch.nn.utils.clip_grad_norm_(self.qformer.parameters(), max_norm=2.0)
 
@@ -201,44 +240,40 @@ class DiVAModel(PreTrainedModel):
         input_ids = input_ids.to(decoder_device)
         attention_mask = attention_mask.to(decoder_device)
 
-        # Generate text embeddings
-        text_embed = self.llm_decoder.embed_tokens(input_ids)
-
-        # with torch.no_grad():
-        #     with torch.autocast(device_type="cuda", dtype=torch.float32):
+        non_pad_mask = input_ids != torch.tensor([self.pad_token_id], device=decoder_device)  # Shape: (Batch, Seq_len)
+        non_pad_mask_int = non_pad_mask.long()
+        push_forward_padding = torch.argsort(non_pad_mask_int, dim=1, descending=True)
+        input_ids_right_pad = torch.gather(input_ids, dim=1, index=push_forward_padding)
+        attention_mask_right_pad = torch.gather(attention_mask, dim=1, index=push_forward_padding)
+        text_embed = self.llm_decoder.embed_tokens(input_ids_right_pad)
+        
         text_response = self.llm_decoder(
             inputs_embeds=text_embed,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask_right_pad,
             return_dict=True,
             output_hidden_states=True
         )
-        # if text_embed.size(0) == 1:
-        #     audio_embed = audio_embed.unsqueeze(0)
+
         max_seq_len = 1024
         curr_padded_audio_embed = self.pad_token_embed.expand(
             audio_embed.size(0), max_seq_len, audio_embed.size(2)
         ).clone()
         curr_padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
 
-        # padded_audio_embed = torch.zeros(
-        #     audio_embed.size(0), max_seq_len, audio_embed.size(2),
-        #     device=decoder_device, dtype=audio_embed.dtype
-        # )
-        # padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
-
         attention_mask_aud = torch.zeros(
             audio_embed.size(0), max_seq_len,
-            device=decoder_device, dtype=torch.long
+            device=audio_embed.device, dtype=torch.long
         )
         attention_mask_aud[:, :audio_embed.size(1)] = 1
-        
+
         audio_response = self.llm_decoder(
             inputs_embeds=curr_padded_audio_embed,
             attention_mask=attention_mask_aud,
             return_dict=True,
             output_hidden_states=True
         )
-        return audio_embed, text_embed, audio_response.last_hidden_state, text_response.last_hidden_state
+
+        return audio_embed, text_embed, audio_response.last_hidden_state, text_response.last_hidden_state, attention_mask_aud
 
     def save(self, path):
         if not os.path.isdir(path):
@@ -305,16 +340,16 @@ class DiVAModel(PreTrainedModel):
                     padding=True,
                     padding_side="right",
                 )["input_ids"],
-                device=self.pre_user_suffix.device,
+                device=self.pre_system.device,
             )
             prefix = torch.cat(
                 [
-                    self.pre_user_suffix.expand(
+                    self.pre_system.expand(
                         bsz,
                         -1,
                     ),
                     user_prompt_text,
-                    self.prefix.expand(
+                    self.post_system.expand(
                         bsz,
                         -1,
                     ),
@@ -353,7 +388,7 @@ class DiVAModel(PreTrainedModel):
                 )
                 next_token_logits = next_token_logits.flatten()
             if do_sample:
-                logits = next_token_logits / self.temperature
+                logits = next_token_logits / temperature
                 probs = F.softmax(logits, dim=-1)
                 greedy = torch.multinomial(probs, num_samples=1)[0]
             else:
@@ -361,12 +396,13 @@ class DiVAModel(PreTrainedModel):
             for token_index, out in enumerate(greedy.flatten().tolist()):
                 if not complete[token_index]:
                     outs[token_index].append(out)
-                if out == 128009:
+                if out == self.eos_token_id:
                     complete[token_index] = True
 
             next_embed = self.llm_decoder.model.embed_tokens(greedy.reshape(-1, 1))
             inputs_embeds = next_embed
         return self.tokenizer.batch_decode(outs, skip_special_tokens=True)
+
 
     def generate_stream(
         self,
@@ -375,6 +411,9 @@ class DiVAModel(PreTrainedModel):
         do_sample=False,
         logits_processor=None,
         max_new_tokens=128,
+        return_outputs=False,
+        init_outputs=None,
+        temperature=0.95
     ):
         inputs = self.processor(audio, return_tensors="pt", sampling_rate=16_000)
         input_features = inputs.input_features.to(self.whisper_encoder.device)
@@ -386,27 +425,21 @@ class DiVAModel(PreTrainedModel):
             output_device=self.llm_decoder.model.embed_tokens.weight.device,
         ).squeeze()
 
-        if text_prompt != None and text_prompt != "":
-            user_prompt_text = torch.tensor(
-                self.tokenizer(text_prompt, add_special_tokens=False)["input_ids"],
-                device=self.pre_user_suffix.device,
-            )
-            prefix = torch.cat(
-                [self.pre_user_suffix, user_prompt_text, self.prefix], axis=0
-            )
-        else:
-            prefix = self.prefix
-        prefix_embed = self.llm_decoder.model.embed_tokens(prefix)
-        suffix = self.final_header
-        suffix_embed = self.llm_decoder.model.embed_tokens(suffix)
+        prefix_embed = self.llm_decoder.model.embed_tokens(torch.cat(
+            [self.pre_user_suffix, self.prefix],
+            axis=0,
+        ))
+        suffix_embed = self.llm_decoder.model.embed_tokens(self.final_header)
+
         inputs_embeds = torch.cat(
             [prefix_embed, virt_tokens, suffix_embed], axis=0
         ).unsqueeze(0)
+
         outs = []
-        outputs = None
+        outputs = init_outputs
         greedy = 1
         i = 0
-        while greedy != 128009 and len(outs) < max_new_tokens:
+        while greedy != self.eos_token_id and len(outs) < max_new_tokens:
             past_key_values = outputs.past_key_values if outputs else None
             outputs = self.llm_decoder(
                 inputs_embeds=inputs_embeds.to(
@@ -427,17 +460,26 @@ class DiVAModel(PreTrainedModel):
                 )
                 next_token_logits = next_token_logits.flatten()
             if do_sample:
-                logits = next_token_logits / self.temperature
+                logits = next_token_logits / temperature
                 probs = F.softmax(logits, dim=-1)
                 greedy = torch.multinomial(probs, num_samples=1)[0]
             else:
                 greedy = next_token_logits.argmax()
             outs.append(greedy)
+            print("greedy", greedy)
             next_embed = self.llm_decoder.model.embed_tokens(greedy.reshape(1, 1))
             inputs_embeds = next_embed
-            yield self.tokenizer.decode(outs, skip_special_tokens=True).replace(
-                "<|eot_id|>", ""
+            if not return_outputs:
+                yield self.tokenizer.decode(outs, skip_special_tokens=True)
+            else:
+                yield (
+                    self.tokenizer.decode(outs, skip_special_tokens=True),
+                    outputs,
+                )
+        if not return_outputs:
+            return self.tokenizer.decode(outs, skip_special_tokens=True)
+        else:
+            return (
+                self.tokenizer.decode(outs, skip_special_tokens=True),
+                outputs,
             )
-        return self.tokenizer.decode(outs, skip_special_tokens=True).replace(
-            "<|eot_id|>", ""
-        )

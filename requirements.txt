@@ -10,3 +10,7 @@ accelerate
 scipy
 soundfile
 jiwer
+# =====================
+gradio
+spaces
+transformers_stream_generator

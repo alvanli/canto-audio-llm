@@ -1,10 +1,15 @@
 services:
   canto-audio-llm:
     ipc: host
+    network_mode: "host"
     build:
       context: .
       dockerfile: Dockerfile
     image: "canto-audio-llm"
+    ports:
+      - "8080:8080"
+      - "8870:8870"
+      - "8000:8000"
     deploy:
       resources:
         reservations:
@@ -17,6 +22,8 @@ services:
       HF_TOKEN: ${HF_TOKEN}
       HF_HUB_CACHE: /exp/cache
       WANDB_API_KEY: ${WANDB_API_KEY}
+      GRADIO_SERVER_NAME: "0.0.0.0"
+      GRADIO_SERVER_PORT: 8000
     volumes:
       - ~/Documents/canto-audio-llm:/exp
-      - ~/Documents/canto-youtube-dl:/data
+      - ~/Documents/redo-canto-youtube-dl:/data
