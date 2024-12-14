@@ -37,14 +37,14 @@ diva_model = DiVAModel(
     whisper_path="alvanlii/whisper-small-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
     is_train=False, speech_encoder_device="cuda:1"
 )
-diva_model.load_prev_checkpoint(f"./logs/v04/step_232800")
+diva_model.load_prev_checkpoint(f"./logs/v05/step_175200")
 
 resampler = Audio(sampling_rate=16_000)
 
 
 @spaces.GPU
 @torch.no_grad
-def diva_audio(audio_input, do_sample=True, temperature=0.001):
+def diva_audio(audio_input, do_sample=False, temperature=0.001):
     sr, y = audio_input
     x = xxhash.xxh32(bytes(y)).hexdigest()
     y = y.astype(np.float32)

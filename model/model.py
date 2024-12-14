@@ -18,18 +18,24 @@ from transformers import (
 from .modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
 from .modeling_whisper import WhisperForConditionalGeneration
 
-WHISPER_EMBED_DIM = 1280
+# WHISPER_EMBED_DIM = 1280
+# QWEN_DIM = 3584
+# WHISPER_MAX_LENGTH = 448
+
+
+WHISPER_EMBED_DIM = 768
 QWEN_DIM = 3584
 WHISPER_MAX_LENGTH = 448
 
 class QFormer(nn.Module):
     def __init__(
         self,
+        whisper_embed_dim, qwen_dim, whisper_max_length
     ):
         super().__init__()
         self.decoder = None
-        self.projection = nn.Linear(WHISPER_EMBED_DIM, QWEN_DIM)
-        self.query_tokens = nn.Parameter(torch.randn(WHISPER_MAX_LENGTH, WHISPER_EMBED_DIM))
+        self.projection = nn.Linear(whisper_embed_dim, qwen_dim)
+        self.query_tokens = nn.Parameter(torch.randn(whisper_max_length, whisper_embed_dim))
 
     def forward(self, x, output_device="cuda:0"):
         bsz = x.shape[0]
@@ -54,7 +60,9 @@ class DiVAModel(PreTrainedModel):
         whisper = WhisperForConditionalGeneration.from_pretrained(
             whisper_path
         )
-        connector = QFormer()
+        connector = QFormer(
+            whisper_embed_dim=whisper.config.d_model,
+            qwen_dim=3584, whisper_max_length=whisper.config.max_length)
         connector.decoder = copy.deepcopy(whisper.model.decoder)
         if via_path is not None:
             with open(via_path, "rb") as f:
