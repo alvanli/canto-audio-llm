@@ -37,14 +37,18 @@ class QFormer(nn.Module):
         self.projection = nn.Linear(whisper_embed_dim, qwen_dim)
         self.query_tokens = nn.Parameter(torch.randn(whisper_max_length, whisper_embed_dim))
 
-    def forward(self, x, output_device="cuda:0"):
+    def forward(self, x, output_device="cuda:1"):
         bsz = x.shape[0]
         query_tokens = self.query_tokens[None, :, :].expand(bsz, -1, -1)
         virt_whisper_tokens = self.decoder(
             inputs_embeds=query_tokens, encoder_hidden_states=x
         )
-        virtual_tokens = self.projection(virt_whisper_tokens[0])
+        if self.projection.weight.shape[-1] == 5120:
+            virtual_tokens = self.projection(virt_whisper_tokens[0].reshape(112, 5120))
+        else:
+            virtual_tokens = self.projection(virt_whisper_tokens[0])
         return virtual_tokens.to(output_device)
+
 
 
 class DiVAModel(PreTrainedModel):
@@ -62,7 +66,7 @@ class DiVAModel(PreTrainedModel):
         )
         connector = QFormer(
             whisper_embed_dim=whisper.config.d_model,
-            qwen_dim=3584, whisper_max_length=whisper.config.max_length)
+            qwen_dim=3584, whisper_max_length=whisper.config.max_target_positions)
         connector.decoder = copy.deepcopy(whisper.model.decoder)
         if via_path is not None:
             with open(via_path, "rb") as f:
@@ -133,21 +137,7 @@ class DiVAModel(PreTrainedModel):
 
         print("prefix", prefix, "suffix", suffix)
         non_null = [line for line in prefix.split("\n") if line.strip()]
-        # prefix_tok = self.tokenizer.encode(prefix, add_special_tokens=False)
-        # suffix_tok = self.tokenizer.encode(suffix, add_special_tokens=False)
-        # self.prefix = torch.tensor(prefix_tok).to(
-        #     self.llm_decoder.model.embed_tokens.weight.device
-        # )
 
-        # self.pre_system = torch.tensor(
-        #     self.tokenizer.encode(non_null[0] + "\n", add_special_tokens=False)
-        # ).to(self.llm_decoder.model.embed_tokens.weight.device)
-        # self.post_system = torch.tensor(
-        #     self.tokenizer.encode("\n" + non_null[-1] + "\n", add_special_tokens=False)
-        # ).to(self.llm_decoder.model.embed_tokens.weight.device)
-        # self.final_header = torch.tensor(suffix_tok).to(
-        #     self.llm_decoder.model.embed_tokens.weight.device
-        # )
         self.eos_token_id = 151645
         self.bos_token_id = 151644
         if is_train:
@@ -235,11 +225,11 @@ class DiVAModel(PreTrainedModel):
         inputs = self.processor(audio, return_tensors="pt", sampling_rate=16_000)
         input_features = inputs.input_features.to(self.speech_encoder_device)
         whisper_out = self.whisper_encoder(input_features=input_features)
-        hidden_states = whisper_out["last_hidden_state"]
-        if torch.isnan(hidden_states).any():
-            breakpoint()
+        hidden_states = whisper_out["last_hidden_state"] # (B, 1500, 1280)
+
         decoder_device = self.llm_decoder.embed_tokens.weight.device
 
+        # Get audio embeddings - this will be 448 length
         audio_embed = self.qformer(
             hidden_states,
             output_device=decoder_device,
@@ -248,40 +238,44 @@ class DiVAModel(PreTrainedModel):
         input_ids = input_ids.to(decoder_device)
         attention_mask = attention_mask.to(decoder_device)
 
-        non_pad_mask = input_ids != torch.tensor([self.pad_token_id], device=decoder_device)  # Shape: (Batch, Seq_len)
-        non_pad_mask_int = non_pad_mask.long()
-        push_forward_padding = torch.argsort(non_pad_mask_int, dim=1, descending=True)
-        input_ids_right_pad = torch.gather(input_ids, dim=1, index=push_forward_padding)
-        attention_mask_right_pad = torch.gather(attention_mask, dim=1, index=push_forward_padding)
-        text_embed = self.llm_decoder.embed_tokens(input_ids_right_pad)
+        # Truncate or pad the text embeddings to match audio length (448)
+        non_pad_mask = input_ids != self.pad_token_id
+        push_forward_padding = torch.argsort(non_pad_mask.long(), dim=1, descending=True)
+        input_ids_left_pad = torch.gather(input_ids, dim=1, index=push_forward_padding)
+        attention_mask_left_pad = torch.gather(attention_mask, dim=1, index=push_forward_padding)
         
+        # Truncate or pad to match audio length (448)
+        if input_ids_left_pad.size(1) > 448:
+            input_ids_left_pad = input_ids_left_pad[:, -448:]
+            attention_mask_left_pad = attention_mask_left_pad[:, -448:]
+        elif input_ids_left_pad.size(1) < 448:
+            pad_length = 448 - input_ids_left_pad.size(1)
+            input_ids_left_pad = F.pad(input_ids_left_pad, (pad_length, 0), value=self.pad_token_id)
+            attention_mask_left_pad = F.pad(attention_mask_left_pad, (pad_length, 0), value=0)
+    
+
+        text_embed = self.llm_decoder.embed_tokens(input_ids_left_pad)
+
         text_response = self.llm_decoder(
             inputs_embeds=text_embed,
-            attention_mask=attention_mask_right_pad,
+            attention_mask=attention_mask_left_pad,
             return_dict=True,
             output_hidden_states=True
         )
-
-        max_seq_len = 1024
-        curr_padded_audio_embed = self.pad_token_embed.expand(
-            audio_embed.size(0), max_seq_len, audio_embed.size(2)
-        ).clone()
-        curr_padded_audio_embed[:, :audio_embed.size(1), :] = audio_embed
-
-        attention_mask_aud = torch.zeros(
-            audio_embed.size(0), max_seq_len,
-            device=audio_embed.device, dtype=torch.long
-        )
-        attention_mask_aud[:, :audio_embed.size(1)] = 1
 
         audio_response = self.llm_decoder(
-            inputs_embeds=curr_padded_audio_embed,
-            attention_mask=attention_mask_aud,
+            inputs_embeds=audio_embed,
+            attention_mask=torch.ones((audio_embed.size(0), audio_embed.size(1)), device=audio_embed.device),
             return_dict=True,
             output_hidden_states=True
         )
 
-        return audio_embed, text_embed, audio_response.last_hidden_state, text_response.last_hidden_state, attention_mask_aud
+        return (
+            audio_embed,  # Shape: (B, 448, embed_dim)
+            text_embed,   # Shape: (B, 448, embed_dim) 
+            audio_response.last_hidden_state,
+            text_response.last_hidden_state
+        )
 
     def save(self, path):
         if not os.path.isdir(path):
