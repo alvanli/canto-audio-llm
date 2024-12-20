@@ -82,7 +82,7 @@ def train_step(model, batch, args):
     # Now shapes should match for multiplication
     contrastive_loss = (contrastive_loss * reversed_loss_mask).sum() / (reversed_loss_mask.sum() + 1e-6)
     
-    loss = contrastive_loss / args.batch_size
+    loss = (kl_loss * args.w1 + contrastive_loss * args.w2) / args.batch_size
     loss.backward()
     
     return {
@@ -97,6 +97,7 @@ def data_collator(features):
     attention_mask = torch.stack([torch.tensor(f['attention_mask']) for f in features])
     audio = [feat['audio']['array'] for feat in features]
     return {'input_ids': input_ids, 'attention_mask': attention_mask, 'audio': audio}
+
 
 if __name__ == "__main__":
     parser = HfArgumentParser((TrainArguments))
@@ -176,22 +177,19 @@ if __name__ == "__main__":
             scheduler.step()
             
             if accum_samples >= model_args.batch_size:
-                # if model_args.clip_grad_norm > 0:
-                #     torch.nn.utils.clip_grad_norm_(model.parameters(), model_args.clip_grad_norm)
-                
                 optimizer.step()
                 optimizer.zero_grad()
                 accum_samples = 0
                 
-                # Log metrics
-                if curr_steps % model_args.print_every == 0:
-                    log_metrics(curr_steps, all_l2_losses, all_kl_losses, scheduler, model_args.batch_size)
-                
-                # Trim loss history
-                if len(all_l2_losses) > 1000:
-                    all_l2_losses = all_l2_losses[-1000:]
-                    all_kl_losses = all_kl_losses[-1000:]
-                
-                # Save checkpoint
-                if curr_steps % model_args.save_every == 0:
-                    model.save(f"{model_args.save_dir}/step_{curr_steps}")
+            # Log metrics
+            if curr_steps % model_args.print_every == 0:
+                log_metrics(curr_steps, all_l2_losses, all_kl_losses, scheduler, model_args.batch_size)
+            
+            # Trim loss history
+            if len(all_l2_losses) > 1000:
+                all_l2_losses = all_l2_losses[-1000:]
+                all_kl_losses = all_kl_losses[-1000:]
+            
+            # Save checkpoint
+            if curr_steps % model_args.save_every == 0:
+                model.save(f"{model_args.save_dir}/step_{curr_steps}")

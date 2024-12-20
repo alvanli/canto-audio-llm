@@ -151,7 +151,7 @@ class DiVAModel(PreTrainedModel):
         ).to(embed_device)
         self.pre_user_suffix = torch.tensor(
             self.tokenizer.encode(
-                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+                "<|im_start|>system\nYou are a helpful assistant<|im_end|>\n"
             )
         ).to(embed_device)
         self.final_header = torch.tensor(            
@@ -170,8 +170,6 @@ class DiVAModel(PreTrainedModel):
             self.pad_token_embed = self.llm_decoder.model.embed_tokens(
                 torch.tensor([pad_token]).to(self.llm_decoder.device)
             ) 
-        torch.nn.utils.clip_grad_norm_(self.whisper_encoder.parameters(), max_norm=2.0)
-        torch.nn.utils.clip_grad_norm_(self.qformer.parameters(), max_norm=2.0)
 
     def can_generate(cls):
         return False
@@ -234,6 +232,12 @@ class DiVAModel(PreTrainedModel):
             hidden_states,
             output_device=decoder_device,
         )
+
+        bsz = audio_embed.shape[0]
+
+        prefix_embed = self.llm_decoder.embed_tokens(torch.cat([self.pre_user_suffix, self.prefix], axis=0)).expand(bsz, -1, -1)
+        suffix_embed = self.llm_decoder.embed_tokens(self.final_header).expand(bsz, -1, -1)
+        inputs_embeds = torch.cat([prefix_embed, audio_embed, suffix_embed], axis=1)
 
         input_ids = input_ids.to(decoder_device)
         attention_mask = attention_mask.to(decoder_device)

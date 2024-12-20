@@ -15,4 +15,5 @@ HF_HUB_ETAG_TIMEOUT=10000 CUDA_LAUNCH_BLOCKING=1 python3 train.py \
     --warmup_steps 3000 \
     --total_rows 1000000 \
     --w2 1 \
-    --w1 5
+    --w1 2 \
+    --start_step 62400
