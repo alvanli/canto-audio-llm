@@ -18,11 +18,6 @@ from transformers import (
 from .modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
 from .modeling_whisper import WhisperForConditionalGeneration
 
-# WHISPER_EMBED_DIM = 1280
-# QWEN_DIM = 3584
-# WHISPER_MAX_LENGTH = 448
-
-
 WHISPER_EMBED_DIM = 768
 QWEN_DIM = 3584
 WHISPER_MAX_LENGTH = 448
@@ -62,7 +57,7 @@ class DiVAModel(PreTrainedModel):
         super().__init__(DiVAConfig.from_dict(config_dict))
 
         whisper = WhisperForConditionalGeneration.from_pretrained(
-            whisper_path
+            whisper_path, attn_implementation="sdpa"
         )
         connector = QFormer(
             whisper_embed_dim=whisper.config.d_model,
@@ -83,28 +78,16 @@ class DiVAModel(PreTrainedModel):
                 }
                 connector.decoder.load_state_dict(wsd)
 
-        
-        if device_map == None:
-            if is_train:
-                num_layers = 28
-                split_index = 17
-                device_map = dict(
-                    **{"embed_tokens": 0, "norm": 0},
-                    **{
-                        f"layers.{i}": 0 if i < split_index else 1
-                        for i in range(num_layers)
-                    },
-                )
-            else:
-                num_layers = 28
-                split_index = 12
-                device_map = dict(
-                    **{"model.embed_tokens": 0, "model.norm": 0, "lm_head": 0},
-                    **{
-                        f"model.layers.{i}": 0 if i < split_index else 1
-                        for i in range(num_layers)
-                    },
-                )
+        if is_train:
+            num_layers = 28
+            split_index = 15
+            device_map = dict(
+                **{"embed_tokens": 0, "norm": 0},
+                **{
+                    f"layers.{i}": 0 if i < split_index else 1
+                    for i in range(num_layers)
+                },
+            )
 
         self.qformer = connector.to(speech_encoder_device)
         self.whisper_encoder = whisper.model.encoder.to(speech_encoder_device)
@@ -114,62 +97,47 @@ class DiVAModel(PreTrainedModel):
             self.llm_decoder = Qwen2Model.from_pretrained(
                 llm_path,
                 device_map=device_map,
+                attn_implementation="sdpa"
             )
             self.llm_decoder.requires_grad_(False)
+            self.llm_decoder_device = self.llm_decoder.embed_tokens.weight.device
+            for param in self.whisper_encoder.parameters():
+                param.requires_grad = False
         else:
             self.llm_decoder = Qwen2ForCausalLM.from_pretrained(
                 llm_path,
                 device_map=device_map,
+                attn_implementation="sdpa"
             )
+            self.llm_decoder_device = self.llm_decoder.model.embed_tokens.weight.device
+
         
         self.processor = AutoProcessor.from_pretrained(whisper_path)
         self.tokenizer = AutoTokenizer.from_pretrained(llm_path)
-        
-        if self.tokenizer.pad_token_id == None:
-            override_token = list(self.tokenizer.added_tokens_decoder.items())[-1]
-            self.tokenizer.pad_token_id = override_token[0]
-            self.tokenizer.pad_tokn = str(override_token[1])
         prefix, suffix = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": "PLACEHOLDER"}],
             tokenize=False,
             add_generation_prompt=True,
         ).split("PLACEHOLDER")
-
-        print("prefix", prefix, "suffix", suffix)
         non_null = [line for line in prefix.split("\n") if line.strip()]
+        prefix_tok = self.tokenizer.encode(prefix, add_special_tokens=False)
+        suffix_tok = self.tokenizer.encode(suffix, add_special_tokens=False)
+        self.prefix = torch.tensor(prefix_tok).to(
+            self.llm_decoder_device
+        )
 
-        self.eos_token_id = 151645
-        self.bos_token_id = 151644
-        if is_train:
-            embed_device = self.llm_decoder.embed_tokens.weight.device
-        else:
-            embed_device = self.llm_decoder.model.embed_tokens.weight.device
-        self.prefix = torch.tensor(
-            self.tokenizer.encode(
-                "<|im_start|>user\n\n"
-            )
-        ).to(embed_device)
-        self.pre_user_suffix = torch.tensor(
-            self.tokenizer.encode(
-                "<|im_start|>system\nYou are a helpful assistant<|im_end|>\n"
-            )
-        ).to(embed_device)
-        self.final_header = torch.tensor(            
-            self.tokenizer.encode(
-                "<|im_end|>\n<|im_start>assistant\n\n"
-            )
-        ).to(embed_device)
+        self.pre_system = torch.tensor(
+            self.tokenizer.encode(non_null[0] + "\n", add_special_tokens=False)
+        ).to(self.llm_decoder_device)
+        self.post_system = torch.tensor(
+            self.tokenizer.encode("\n" + non_null[-1] + "\n", add_special_tokens=False)
+        ).to(self.llm_decoder_device)
+        self.final_header = torch.tensor(suffix_tok).to(
+            self.llm_decoder_device
+        )
         self.speech_encoder_device = speech_encoder_device
-        pad_token = self.tokenizer.encode("<|endoftext|>")[0]
-        self.pad_token_id = pad_token
-        if is_train:
-            self.pad_token_embed = self.llm_decoder.embed_tokens(
-                torch.tensor([pad_token]).to(self.llm_decoder.device)
-            ) 
-        else:
-            self.pad_token_embed = self.llm_decoder.model.embed_tokens(
-                torch.tensor([pad_token]).to(self.llm_decoder.device)
-            ) 
+        self.eos_token = self.tokenizer.eos_token
+        self.default_prompt = "重複返用家輸入嗰句說話"
 
     def can_generate(cls):
         return False
@@ -223,11 +191,9 @@ class DiVAModel(PreTrainedModel):
         inputs = self.processor(audio, return_tensors="pt", sampling_rate=16_000)
         input_features = inputs.input_features.to(self.speech_encoder_device)
         whisper_out = self.whisper_encoder(input_features=input_features)
-        hidden_states = whisper_out["last_hidden_state"] # (B, 1500, 1280)
+        hidden_states = whisper_out["last_hidden_state"]
 
         decoder_device = self.llm_decoder.embed_tokens.weight.device
-
-        # Get audio embeddings - this will be 448 length
         audio_embed = self.qformer(
             hidden_states,
             output_device=decoder_device,
@@ -235,60 +201,92 @@ class DiVAModel(PreTrainedModel):
 
         bsz = audio_embed.shape[0]
 
-        prefix_embed = self.llm_decoder.embed_tokens(torch.cat([self.pre_user_suffix, self.prefix], axis=0)).expand(bsz, -1, -1)
-        suffix_embed = self.llm_decoder.embed_tokens(self.final_header).expand(bsz, -1, -1)
-        inputs_embeds = torch.cat([prefix_embed, audio_embed, suffix_embed], axis=1)
+        prefix_audio = torch.cat([
+            self.pre_system.expand(bsz, -1),
+            self.post_system.expand(bsz, -1),
+        ], dim=1)
+        prefix_audio_embed = self.get_embeddings(prefix_audio)
+        suffix_audio = self.final_header.expand(bsz, -1)
+        suffix_audio_embed = self.get_embeddings(suffix_audio)
+        audio_inputs_embeds = torch.cat([prefix_audio_embed, audio_embed, suffix_audio_embed], dim=1)
 
-        input_ids = input_ids.to(decoder_device)
-        attention_mask = attention_mask.to(decoder_device)
-
-        # Truncate or pad the text embeddings to match audio length (448)
-        non_pad_mask = input_ids != self.pad_token_id
-        push_forward_padding = torch.argsort(non_pad_mask.long(), dim=1, descending=True)
-        input_ids_left_pad = torch.gather(input_ids, dim=1, index=push_forward_padding)
-        attention_mask_left_pad = torch.gather(attention_mask, dim=1, index=push_forward_padding)
+        prefix_text = torch.cat([
+            self.pre_system.expand(bsz, -1),
+            self.post_system.expand(bsz, -1),
+        ], dim=1).to(decoder_device)
         
-        # Truncate or pad to match audio length (448)
-        if input_ids_left_pad.size(1) > 448:
-            input_ids_left_pad = input_ids_left_pad[:, -448:]
-            attention_mask_left_pad = attention_mask_left_pad[:, -448:]
-        elif input_ids_left_pad.size(1) < 448:
-            pad_length = 448 - input_ids_left_pad.size(1)
-            input_ids_left_pad = F.pad(input_ids_left_pad, (pad_length, 0), value=self.pad_token_id)
-            attention_mask_left_pad = F.pad(attention_mask_left_pad, (pad_length, 0), value=0)
-    
+        input_ids = input_ids.to(decoder_device)
+        suffix_text = self.final_header.expand(bsz, -1).to(decoder_device)
 
-        text_embed = self.llm_decoder.embed_tokens(input_ids_left_pad)
+        text_tokens = torch.cat([
+            prefix_text, input_ids, suffix_text
+        ], dim=1)
+        
+        text_attention = torch.cat([
+            torch.ones_like(prefix_text, device=decoder_device),
+            attention_mask.to(decoder_device),
+            torch.ones_like(suffix_text, device=decoder_device)
+        ], dim=1)
+
+        push_back_padding = torch.argsort((text_tokens == self.tokenizer.pad_token_id).long(), dim=1)
+        text_tokens_left_pad = torch.gather(text_tokens, dim=1, index=push_back_padding)
+        text_attention_left_pad = torch.gather(text_attention, dim=1, index=push_back_padding)
+        
+        if text_tokens_left_pad.size(1) > 448:
+            text_tokens_left_pad = text_tokens_left_pad[:, -448:]
+            text_attention_left_pad = text_attention_left_pad[:, -448:]
+        elif text_tokens_left_pad.size(1) < 448:
+            pad_length = 448 - text_tokens_left_pad.size(1)
+            text_tokens_left_pad = F.pad(text_tokens_left_pad, (pad_length, 0), value=self.tokenizer.pad_token_id)
+            text_attention_left_pad = F.pad(text_attention_left_pad, (pad_length, 0), value=0)
+        
+        text_embed = self.get_embeddings(text_tokens_left_pad)
 
         text_response = self.llm_decoder(
             inputs_embeds=text_embed,
-            attention_mask=attention_mask_left_pad,
+            attention_mask=text_attention_left_pad,
             return_dict=True,
             output_hidden_states=True
         )
 
         audio_response = self.llm_decoder(
-            inputs_embeds=audio_embed,
-            attention_mask=torch.ones((audio_embed.size(0), audio_embed.size(1)), device=audio_embed.device),
+            inputs_embeds=audio_inputs_embeds,
+            attention_mask=torch.ones((audio_inputs_embeds.size(0), audio_inputs_embeds.size(1)), 
+                                    device=audio_inputs_embeds.device),
             return_dict=True,
             output_hidden_states=True
         )
 
+        push_forward_padding = torch.argsort((input_ids == self.tokenizer.pad_token_id).long(), dim=1, descending=True)
+        input_ids_right_pad = torch.gather(input_ids, dim=1, index=push_forward_padding)
+        
+        if input_ids_right_pad.size(1) > 448:
+            input_ids_right_pad = input_ids_right_pad[:, :448]
+        elif input_ids_right_pad.size(1) < 448:
+            pad_length = 448 - input_ids_right_pad.size(1)
+            input_ids_right_pad = F.pad(input_ids_right_pad, (0, pad_length), value=self.tokenizer.pad_token_id)
+            
+        text_embeds_wo_prefix_suffix = self.get_embeddings(input_ids_right_pad)
+
         return (
-            audio_embed,  # Shape: (B, 448, embed_dim)
-            text_embed,   # Shape: (B, 448, embed_dim) 
+            audio_embed,
+            text_embeds_wo_prefix_suffix,
             audio_response.last_hidden_state,
-            text_response.last_hidden_state
+            text_response.last_hidden_state,
+            text_attention_left_pad
         )
+    
+    def get_embeddings(self, input_ids):
+        if hasattr(self.llm_decoder, 'model'):
+            return self.llm_decoder.model.embed_tokens(input_ids)
+        return self.llm_decoder.embed_tokens(input_ids)
 
     def save(self, path):
         if not os.path.isdir(path):
             os.mkdir(path)
-        torch.save(self.whisper_encoder.state_dict(), f'{path}/whisper_encoder.pth')
         torch.save(self.qformer.state_dict(), f'{path}/qformer.pth')
         
     def load_prev_checkpoint(self, path):
-        self.whisper_encoder.load_state_dict(torch.load(f"{path}/whisper_encoder.pth"))
         self.qformer.load_state_dict(torch.load(f"{path}/qformer.pth"))
 
     def forward(self, audio, prefix_text_tokens, suffix_text_tokens):
@@ -299,18 +297,18 @@ class DiVAModel(PreTrainedModel):
         ]
         virt_tokens = self.qformer(
             hidden_states,
-            output_device=self.llm_decoder.model.embed_tokens.weight.device,
+            output_device=self.llm_decoder_device,
         ).squeeze()
 
-        prefix_embed = self.llm_decoder.model.embed_tokens(prefix_text_tokens)
-        suffix_embed = self.llm_decoder.model.embed_tokens(suffix_text_tokens)
+        prefix_embed = self.get_embeddings(prefix_text_tokens)
+        suffix_embed = self.get_embeddings(suffix_text_tokens)
         inputs_embeds = torch.cat(
             [prefix_embed, virt_tokens, suffix_embed], axis=0
         ).unsqueeze(0)
 
         outputs = self.llm_decoder(
             inputs_embeds=inputs_embeds.to(
-                self.llm_decoder.model.embed_tokens.weight.device
+                self.llm_decoder_device
             ).half(),
             return_dict=True,
             output_hidden_states=True
@@ -322,6 +320,7 @@ class DiVAModel(PreTrainedModel):
     def generate(
         self,
         audio,
+        temperature=0.6,
         text_prompt=None,
         do_sample=False,
         logits_processor=None,
@@ -332,56 +331,69 @@ class DiVAModel(PreTrainedModel):
         hidden_states = self.whisper_encoder(input_features=input_features)[
             "last_hidden_state"
         ]
+        
         virt_tokens = self.qformer(
             hidden_states,
-            output_device=self.llm_decoder.model.embed_tokens.weight.device,
+            output_device=self.llm_decoder_device,
         )
+
+        # virt_tokens = self.get_embeddings(
+        #     torch.tensor(
+        #         self.tokenizer.encode(
+        #             "如果我食咗早餐，我就唔會肚餓。我今日冇肚餓，咁我今日食咗早餐未？"
+        #         )
+        #     ).to(self.llm_decoder_device).unsqueeze(0)
+        # )
+
         bsz = virt_tokens.shape[0]
 
-        if text_prompt != None and text_prompt != "":
-            user_prompt_text = torch.tensor(
-                self.tokenizer(
-                    text_prompt,
-                    add_special_tokens=False,
-                    padding=True,
-                    padding_side="right",
-                )["input_ids"],
-                device=self.pre_system.device,
-            )
-            prefix = torch.cat(
-                [
-                    self.pre_system.expand(
-                        bsz,
-                        -1,
-                    ),
-                    user_prompt_text,
-                    self.post_system.expand(
-                        bsz,
-                        -1,
-                    ),
-                ],
-                axis=1,
-            )
-        else:
-            prefix = self.prefix
-        prefix_embed = self.llm_decoder.model.embed_tokens(prefix).expand(bsz, -1, -1)
+        if text_prompt is None:
+            text_prompt = self.default_prompt
+        user_prompt_text = torch.tensor(
+            self.tokenizer.encode(text_prompt),
+            device=self.pre_system.device,
+        ).expand(bsz, -1)
+
+        prefix = torch.cat(
+            [
+                self.pre_system.expand(bsz, -1),
+                user_prompt_text,
+                self.post_system.expand(bsz,-1),
+            ],
+            axis=1,
+        )
+        prefix_embed = self.get_embeddings(prefix).expand(bsz, -1, -1)
         suffix = self.final_header
-        suffix_embed = self.llm_decoder.model.embed_tokens(suffix).expand(bsz, -1, -1)
+        suffix_embed = self.get_embeddings(suffix).expand(bsz, -1, -1)
         inputs_embeds = torch.cat([prefix_embed, virt_tokens, suffix_embed], axis=1)
+
+
+        # bsz=1
+        # suffix = self.final_header
+        # conversation = []
+        # conversation.append({"role": "system", "content": "你係由 hon9kon9ize 開發嘅 CantoneseLLM，你係一個好幫得手嘅助理" })
+        # conversation.append({"role": "user", "content": "如果我食咗早餐，我就唔會肚餓。我今日冇肚餓，咁我今日食咗早餐未"})
+        # input_ids = self.tokenizer.apply_chat_template(conversation, tokenize=True, add_generation_prompt=True, return_tensors='pt')
+        # inputs_embeds = self.get_embeddings(input_ids).expand(bsz, -1,-1)
+
+
+        inputs_embeds = inputs_embeds.to(
+            self.llm_decoder_device
+        ).half()
+
         outs = [[] for i in range(bsz)]
         complete = [False] * bsz
         outputs = None
         greedy = 1
         i = 0
+        past_key_values = None
         while not all(complete) and len(outs[0]) < max_new_tokens:
-            past_key_values = outputs.past_key_values if outputs else None
             outputs = self.llm_decoder(
-                inputs_embeds=inputs_embeds.to(
-                    self.llm_decoder.model.embed_tokens.weight.device
-                ).half(),
+                inputs_embeds=inputs_embeds,
                 return_dict=True,
                 output_hidden_states=True,
                 past_key_values=past_key_values,
+                use_cache=True
             )
             next_token_logits = outputs.logits[:, -1, :]
 
@@ -402,90 +414,11 @@ class DiVAModel(PreTrainedModel):
             for token_index, out in enumerate(greedy.flatten().tolist()):
                 if not complete[token_index]:
                     outs[token_index].append(out)
-                if out == self.eos_token_id:
+                if out == self.tokenizer.eos_token_id:
                     complete[token_index] = True
 
-            next_embed = self.llm_decoder.model.embed_tokens(greedy.reshape(-1, 1))
+            next_embed = self.get_embeddings(greedy.reshape(-1, 1))
             inputs_embeds = next_embed
+            past_key_values = outputs['past_key_values']
+
         return self.tokenizer.batch_decode(outs, skip_special_tokens=True)
-
-
-    def generate_stream(
-        self,
-        audio,
-        text_prompt,
-        do_sample=False,
-        logits_processor=None,
-        max_new_tokens=128,
-        return_outputs=False,
-        init_outputs=None,
-        temperature=0.95
-    ):
-        inputs = self.processor(audio, return_tensors="pt", sampling_rate=16_000)
-        input_features = inputs.input_features.to(self.whisper_encoder.device)
-        hidden_states = self.whisper_encoder(input_features=input_features)[
-            "last_hidden_state"
-        ]
-        virt_tokens = self.qformer(
-            hidden_states,
-            output_device=self.llm_decoder.model.embed_tokens.weight.device,
-        ).squeeze()
-
-        prefix_embed = self.llm_decoder.model.embed_tokens(torch.cat(
-            [self.pre_user_suffix, self.prefix],
-            axis=0,
-        ))
-        suffix_embed = self.llm_decoder.model.embed_tokens(self.final_header)
-
-        inputs_embeds = torch.cat(
-            [prefix_embed, virt_tokens, suffix_embed], axis=0
-        ).unsqueeze(0)
-
-        outs = []
-        outputs = init_outputs
-        greedy = 1
-        i = 0
-        while greedy != self.eos_token_id and len(outs) < max_new_tokens:
-            past_key_values = outputs.past_key_values if outputs else None
-            outputs = self.llm_decoder(
-                inputs_embeds=inputs_embeds.to(
-                    self.llm_decoder.model.embed_tokens.weight.device
-                ).half(),
-                return_dict=True,
-                output_hidden_states=True,
-                past_key_values=past_key_values,
-            )
-            next_token_logits = outputs.logits[-1, -1, :]
-
-            if logits_processor:
-                local_outs = torch.tensor(outs) if outs != [] else suffix
-                local_outs = local_outs.reshape(1, -1)
-                next_token_logits = logits_processor(
-                    local_outs,
-                    next_token_logits.reshape(1, -1),
-                )
-                next_token_logits = next_token_logits.flatten()
-            if do_sample:
-                logits = next_token_logits / temperature
-                probs = F.softmax(logits, dim=-1)
-                greedy = torch.multinomial(probs, num_samples=1)[0]
-            else:
-                greedy = next_token_logits.argmax()
-            outs.append(greedy)
-            print("greedy", greedy)
-            next_embed = self.llm_decoder.model.embed_tokens(greedy.reshape(1, 1))
-            inputs_embeds = next_embed
-            if not return_outputs:
-                yield self.tokenizer.decode(outs, skip_special_tokens=True)
-            else:
-                yield (
-                    self.tokenizer.decode(outs, skip_special_tokens=True),
-                    outputs,
-                )
-        if not return_outputs:
-            return self.tokenizer.decode(outs, skip_special_tokens=True)
-        else:
-            return (
-                self.tokenizer.decode(outs, skip_special_tokens=True),
-                outputs,
-            )

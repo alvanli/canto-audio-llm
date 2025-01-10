@@ -52,34 +52,25 @@ class TrainArguments:
 def train_step(model, batch, args):
     audio, input_ids, attention_mask = batch['audio'], batch['input_ids'], batch['attention_mask']
     
-    audio_embed, text_embed, audio_response, text_response = model.train_forward(
+    audio_embed, text_embed, audio_response, text_response, text_attention_left_pad = model.train_forward(
         audio, input_ids, attention_mask
     )
     
-    # KL Loss using final states
-    diff_distill = audio_response[:, -1] - text_response[:, -1]  # Shape: (B, embed_dim)
+    diff_distill = audio_response[:, -1] - text_response[:, -1]
     kl_loss = torch.sqrt(torch.sum(diff_distill * diff_distill, dim=-1)).mean()
     
-    # Attention mask needs to match audio_embed sequence length
-    attention_mask = attention_mask[:, :448]  # Truncate to 448
-    if attention_mask.size(1) < 448:
-        pad_length = 448 - attention_mask.size(1)
-        attention_mask = F.pad(attention_mask, (0, pad_length), value=0)
-    
-    # Create loss mask
-    shifted_loss_mask = torch.roll(attention_mask, shifts=1, dims=1)  # Shape: (B, 448)
-    one_hot_first = torch.zeros_like(attention_mask)  # Shape: (B, 448)
+
+    shifted_loss_mask = torch.roll(text_attention_left_pad, shifts=1, dims=1)
+    one_hot_first = torch.zeros_like(text_attention_left_pad)
     one_hot_first[:, 0] = 1
-    corrected_loss_mask = shifted_loss_mask + one_hot_first  # Shape: (B, 448)
-    reversed_loss_mask = torch.flip(corrected_loss_mask, dims=[1])  # Shape: (B, 448)
-    reversed_loss_mask = (reversed_loss_mask > 0).float()
-    reversed_loss_mask = reversed_loss_mask.to(audio_embed.device)
+    corrected_loss_mask = shifted_loss_mask + one_hot_first
+    reversed_loss_mask = torch.flip(corrected_loss_mask, [1])
     
-    diff_contrast = audio_embed - text_embed  # Shape: (B, 448, embed_dim)
-    contrastive_squared_diff = torch.sum(diff_contrast * diff_contrast, dim=-1)  # Shape: (B, 448)
-    contrastive_loss = torch.sqrt(contrastive_squared_diff)  # Shape: (B, 448)
     
-    # Now shapes should match for multiplication
+    diff_contrast = audio_embed - text_embed
+    contrastive_squared_diff = torch.sum(diff_contrast * diff_contrast, dim=-1)
+    contrastive_loss = torch.sqrt(contrastive_squared_diff)
+    
     contrastive_loss = (contrastive_loss * reversed_loss_mask).sum() / (reversed_loss_mask.sum() + 1e-6)
     
     loss = (kl_loss * args.w1 + contrastive_loss * args.w2) / args.batch_size
@@ -98,6 +89,29 @@ def data_collator(features):
     audio = [feat['audio']['array'] for feat in features]
     return {'input_ids': input_ids, 'attention_mask': attention_mask, 'audio': audio}
 
+def print_trainable_parameters(model):
+    trainable_params = []
+    frozen_params = []
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            trainable_params.append((name, param.shape))
+        else:
+            frozen_params.append((name, param.shape))
+    
+    print("Trainable parameters:")
+    for name, shape in trainable_params:
+        print(f"{name}: {shape}")
+    
+    # print("\nFrozen parameters:")
+    # for name, shape in frozen_params:
+    #     print(f"{name}: {shape}")
+    
+    trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params_count = sum(p.numel() for p in model.parameters())
+    
+    print(f"\nTotal trainable parameters: {trainable_params_count:,}")
+    print(f"Total parameters: {total_params_count:,}")
 
 if __name__ == "__main__":
     parser = HfArgumentParser((TrainArguments))
@@ -115,12 +129,9 @@ if __name__ == "__main__":
         whisper_path="alvanlii/whisper-small-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
         is_train=True, speech_encoder_device="cuda:1"
     )
-    # model = DiVAModel(
-    #     whisper_path="./logs/smaller-turbo", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
-    #     is_train=True, speech_encoder_device="cuda:1"
-    # )
+    
     model = torch.compile(model)
-
+    print_trainable_parameters(model)
     if model_args.start_step > 0:
         model.load_prev_checkpoint(f"{model_args.save_dir}/step_{model_args.start_step}")
 
@@ -181,15 +192,12 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 accum_samples = 0
                 
-            # Log metrics
             if curr_steps % model_args.print_every == 0:
                 log_metrics(curr_steps, all_l2_losses, all_kl_losses, scheduler, model_args.batch_size)
             
-            # Trim loss history
             if len(all_l2_losses) > 1000:
                 all_l2_losses = all_l2_losses[-1000:]
                 all_kl_losses = all_kl_losses[-1000:]
             
-            # Save checkpoint
             if curr_steps % model_args.save_every == 0:
                 model.save(f"{model_args.save_dir}/step_{curr_steps}")

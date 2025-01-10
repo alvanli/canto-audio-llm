@@ -1,4 +1,4 @@
-LOG_DIR="./logs/v07"
+LOG_DIR="./logs/v10"
 
 mkdir $LOG_DIR
 cp train.py "$LOG_DIR/"
@@ -6,14 +6,14 @@ cp -r model "$LOG_DIR/"
 
 HF_HUB_ETAG_TIMEOUT=10000 CUDA_LAUNCH_BLOCKING=1 python3 train.py \
     --num_epochs 1 \
-    --microbatch_size 2 \
-    --batch_size 300 \
+    --microbatch_size 3 \
+    --batch_size 400 \
     --save_dir "$LOG_DIR" \
-    --print_every 600 \
+    --print_every 300 \
     --save_every 2400 \
     --lr 5e-05 \
-    --warmup_steps 3000 \
-    --total_rows 1000000 \
+    --warmup_steps 4000 \
+    --total_rows 1400000 \
     --w2 1 \
     --w1 1 \
-    --start_step 360000
+    --start_step 211200

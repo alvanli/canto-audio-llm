@@ -37,7 +37,7 @@ diva_model = DiVAModel(
     whisper_path="alvanlii/whisper-small-cantonese", llm_path="hon9kon9ize/CantoneseLLMChat-v1.0-7B",
     is_train=False, speech_encoder_device="cuda:1"
 )
-diva_model.load_prev_checkpoint(f"./logs/v07/step_96000")
+diva_model.load_prev_checkpoint(f"./logs/v10/step_388800")
 
 resampler = Audio(sampling_rate=16_000)
 

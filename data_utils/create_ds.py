@@ -78,8 +78,7 @@ if __name__ == "__main__":
     print(cv_en_ds[10]['text'])
     print(len(d1), len(cv_en_ds), len(combined_dataset))
     combined_dataset = combined_dataset.shuffle()
-    combined_dataset = combined_dataset.filter(filter_audio_length)
-    combined_dataset.save_to_disk("./data/combined_english_canto")
+    # combined_dataset.save_to_disk("./data/combined_english_canto")
 
     # del combined_dataset
     # import gc
